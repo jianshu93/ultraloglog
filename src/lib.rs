@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "stdsimd", feature(portable_simd))]
+
 // This implementation is based on the Java version
 // https://github.com/dynatrace-oss/hash4j/
 // See the paper "UltraLogLog: A Practical and More Space-Efficient Alternative to HyperLogLog for Approximate Distinct Counting"
@@ -6,6 +8,12 @@
 mod python;
 #[cfg(feature = "python")]
 pub use python::*;
+
+#[cfg(feature = "stdsimd")]
+use std::simd::Simd;
+
+#[cfg(feature = "stdsimd")]
+use std::simd::prelude::*;
 
 // Constants for UltraLogLog implementation
 const MIN_P: u32 = 3;
@@ -393,49 +401,147 @@ impl Estimator for OptimalFGRAEstimator {
         let state = &ull.state;
         let m = state.len();
         let p = ull.get_p();
-        let off = (p << 2) + 4;
+        let off_i32 = ((p << 2) + 4) as i32;
 
-        let mut sum = 0.0;
-        let mut c0 = 0;
-        let mut c4 = 0;
-        let mut c8 = 0;
-        let mut c10 = 0;
-        let mut c4w0 = 0;
-        let mut c4w1 = 0;
-        let mut c4w2 = 0;
-        let mut c4w3 = 0;
+        let mut sum = 0.0_f64;
+        let mut c0 = 0i32;
+        let mut c4 = 0i32;
+        let mut c8 = 0i32;
+        let mut c10 = 0i32;
+        let mut c4w0 = 0i32;
+        let mut c4w1 = 0i32;
+        let mut c4w2 = 0i32;
+        let mut c4w3 = 0i32;
 
-        // Process each register
-        for &reg in state {
-            let r = reg as i32;
-            let r2 = r - off as i32;
-            if r2 < 0 {
-                if r2 < -8 {
-                    c0 += 1;
+        #[cfg(feature = "stdsimd")]
+        {
+            // Process in fixed-size SIMD blocks; tail handled scalarly to preserve strict order.
+            const LANES: usize = 16;
+            let mut i = 0usize;
+
+            // SIMD constants
+            let off = off_i32 as i16;
+            let v_off = Simd::<i16, LANES>::splat(off);
+            let v_m8 = Simd::<i16, LANES>::splat(-8);
+            let v_m4 = Simd::<i16, LANES>::splat(-4);
+            let v_m2 = Simd::<i16, LANES>::splat(-2);
+            let v_zero = Simd::<i16, LANES>::splat(0);
+            let v_252u = Simd::<u16, LANES>::splat(252);
+
+            while i + LANES <= state.len() {
+                // Load bytes
+                let chunk_u8 = Simd::<u8, LANES>::from_slice(&state[i..i + LANES]);
+                // Widen for signed arithmetic
+                let chunk_i16 = chunk_u8.cast::<i16>();
+                let r2 = chunk_i16 - v_off;
+
+                // ---- small-range counters (r2 < 0) ----
+                // r2 < -8  → c0
+                c0 += r2.simd_lt(v_m8).to_bitmask().count_ones() as i32;
+                // r2 == -8 → c4
+                c4 += r2.simd_eq(v_m8).to_bitmask().count_ones() as i32;
+                // r2 == -4 → c8
+                c8 += r2.simd_eq(v_m4).to_bitmask().count_ones() as i32;
+                // r2 == -2 → c10
+                c10 += r2.simd_eq(v_m2).to_bitmask().count_ones() as i32;
+
+                // ---- large-range top buckets r == 252..255 ----
+                let r_u16 = chunk_u8.cast::<u16>();
+                c4w0 += r_u16.simd_eq(Simd::splat(252)).to_bitmask().count_ones() as i32;
+                c4w1 += r_u16.simd_eq(Simd::splat(253)).to_bitmask().count_ones() as i32;
+                c4w2 += r_u16.simd_eq(Simd::splat(254)).to_bitmask().count_ones() as i32;
+                c4w3 += r_u16.simd_eq(Simd::splat(255)).to_bitmask().count_ones() as i32;
+
+                // ---- mid-range direct contributions: 0 <= r2 and r < 252 ----
+                let ge0_bits = r2.simd_ge(v_zero).to_bitmask();
+                let lt252_bits = r_u16.simd_lt(v_252u).to_bitmask();
+                let mid_bits = ge0_bits & lt252_bits;
+
+                if mid_bits != 0 {
+                    // We preserve exact scalar addition order for bit-for-bit identity:
+                    // add lane 0..LANES-1 in order, mapping r2 -> table entry for each lane.
+                    let r2_array = r2.to_array();
+                    let r_arr = chunk_u8.to_array();
+
+                    // Iterate low→high lanes so the floating adds match scalar order.
+                    for lane in 0..LANES {
+                        if ((mid_bits >> lane) & 1) == 1 {
+                            // r < 252 and r2 >= 0
+                            let idx = r2_array[lane] as usize; // 0..=235 by construction
+                            sum += REGISTER_CONTRIBUTIONS[idx];
+                        } else {
+                            let _ = r_arr[lane];
+                        }
+                    }
                 }
-                if r2 == -8 {
-                    c4 += 1;
-                }
-                if r2 == -4 {
-                    c8 += 1;
-                }
-                if r2 == -2 {
-                    c10 += 1;
-                }
-            } else if r < 252 {
-                sum += REGISTER_CONTRIBUTIONS[r2 as usize];
-            } else {
-                match r {
-                    252 => c4w0 += 1,
-                    253 => c4w1 += 1,
-                    254 => c4w2 += 1,
-                    255 => c4w3 += 1,
-                    _ => unreachable!(),
+
+                i += LANES;
+            }
+
+            // Scalar tail (preserves identical order to original implementation)
+            for &reg in &state[i..] {
+                let r = reg as i32;
+                let r2s = r - off_i32;
+                if r2s < 0 {
+                    if r2s < -8 {
+                        c0 += 1;
+                    }
+                    if r2s == -8 {
+                        c4 += 1;
+                    }
+                    if r2s == -4 {
+                        c8 += 1;
+                    }
+                    if r2s == -2 {
+                        c10 += 1;
+                    }
+                } else if r < 252 {
+                    sum += REGISTER_CONTRIBUTIONS[r2s as usize];
+                } else {
+                    match r {
+                        252 => c4w0 += 1,
+                        253 => c4w1 += 1,
+                        254 => c4w2 += 1,
+                        255 => c4w3 += 1,
+                        _ => unreachable!(),
+                    }
                 }
             }
         }
 
-        // Handle small range estimates if needed
+        #[cfg(not(feature = "stdsimd"))]
+        {
+            for &reg in state {
+                let r = reg as i32;
+                let r2 = r - off_i32;
+                if r2 < 0 {
+                    if r2 < -8 {
+                        c0 += 1;
+                    }
+                    if r2 == -8 {
+                        c4 += 1;
+                    }
+                    if r2 == -4 {
+                        c8 += 1;
+                    }
+                    if r2 == -2 {
+                        c10 += 1;
+                    }
+                } else if r < 252 {
+                    sum += REGISTER_CONTRIBUTIONS[r2 as usize];
+                } else {
+                    match r {
+                        252 => c4w0 += 1,
+                        253 => c4w1 += 1,
+                        254 => c4w2 += 1,
+                        255 => c4w3 += 1,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+
+        // Small/large-range corrections (unchanged, scalar math)
         if c0 > 0 || c4 > 0 || c8 > 0 || c10 > 0 {
             let z = Self::small_range_estimate(c0, c4, c8, c10, m as i32);
             if c0 > 0 {
@@ -451,8 +557,6 @@ impl Estimator for OptimalFGRAEstimator {
                 sum += Self::calculate_contribution10(c10, z);
             }
         }
-
-        // Handle large range estimates if needed
         if c4w0 > 0 || c4w1 > 0 || c4w2 > 0 || c4w3 > 0 {
             sum += Self::calculate_large_range_contribution(
                 c4w0,
@@ -464,7 +568,6 @@ impl Estimator for OptimalFGRAEstimator {
             );
         }
 
-        // Return final estimate
         ESTIMATION_FACTORS[(p - MIN_P) as usize] * sum.powf(MINUS_INV_TAU)
     }
 }
@@ -878,48 +981,132 @@ impl Estimator for MaximumLikelihoodEstimator {
         let state = &ull.state;
         let p_i32 = ull.get_p() as i32;
         let m = state.len();
-
-        // Use unsigned arithmetic and logical shifts to mirror Java's `>>>`.
         let mut sum: u64 = 0;
         let mut b = vec![0i32; 64];
 
-        for &r_u8 in state {
-            let r = r_u8 as i32; // Java uses Byte.toUnsignedInt
-            let r2 = r - ((p_i32 << 2) + 4);
+        #[cfg(feature = "stdsimd")]
+        {
+            const LANES: usize = 16;
 
-            if r2 < 0 {
-                // Small-range bucket
-                let mut ret_u: u64 = 4;
-                if r2 == -2 || r2 == -8 {
-                    b[0] += 1;
-                    ret_u = ret_u.wrapping_sub(2);
+            let v_off = Simd::<i16, LANES>::splat(((p_i32 << 2) + 4) as i16);
+
+            let mut i = 0usize;
+            while i + LANES <= state.len() {
+                let r_u8 = Simd::<u8, LANES>::from_slice(&state[i..i + LANES]);
+                let r_i16 = r_u8.cast::<i16>();
+                let r2 = r_i16 - v_off;
+
+                // We now walk lanes in order (0..LANES) to keep bit-for-bit identity.
+                let r_bytes = r_u8.to_array();
+                let r2_vals = r2.to_array();
+
+                for lane in 0..LANES {
+                    let r = r_bytes[lane] as i32;
+                    let r2s = r2_vals[lane] as i32;
+
+                    if r2s < 0 {
+                        // Small-range bucket (identical integer math)
+                        let mut ret_u: u64 = 4;
+                        if r2s == -2 || r2s == -8 {
+                            b[0] += 1;
+                            ret_u = ret_u.wrapping_sub(2);
+                        }
+                        if r2s == -2 || r2s == -4 {
+                            b[1] += 1;
+                            ret_u = ret_u.wrapping_sub(1);
+                        }
+                        let sh = (62 - p_i32) as u32;
+                        sum = sum.wrapping_add(ret_u << sh);
+                    } else {
+                        // Large-range bucket (identical integer math)
+                        let k = (r2s >> 2) as i32;
+                        let y0 = (r & 1) as u64;
+                        let y1 = ((r >> 1) & 1) as u64;
+
+                        let mut ret_u: u64 = 0xE000_0000_0000_0000u64;
+                        ret_u = ret_u.wrapping_sub(y0 << 63);
+                        ret_u = ret_u.wrapping_sub(y1 << 62);
+
+                        let sh: u32 = ((k + p_i32) & 63) as u32;
+                        sum = sum.wrapping_add(ret_u >> sh);
+
+                        b[k as usize] += y0 as i32;
+                        b[(k + 1) as usize] += y1 as i32;
+                        b[(k + 2) as usize] += 1;
+                    }
                 }
-                if r2 == -2 || r2 == -4 {
-                    b[1] += 1;
-                    ret_u = ret_u.wrapping_sub(1);
+
+                i += LANES;
+            }
+
+            // Scalar tail
+            for &r_u8b in &state[i..] {
+                let r = r_u8b as i32;
+                let r2 = r - ((p_i32 << 2) + 4);
+                if r2 < 0 {
+                    let mut ret_u: u64 = 4;
+                    if r2 == -2 || r2 == -8 {
+                        b[0] += 1;
+                        ret_u = ret_u.wrapping_sub(2);
+                    }
+                    if r2 == -2 || r2 == -4 {
+                        b[1] += 1;
+                        ret_u = ret_u.wrapping_sub(1);
+                    }
+                    let sh = (62 - p_i32) as u32;
+                    sum = sum.wrapping_add(ret_u << sh);
+                } else {
+                    let k = r2 >> 2;
+                    let y0 = (r & 1) as u64;
+                    let y1 = ((r >> 1) & 1) as u64;
+
+                    let mut ret_u: u64 = 0xE000_0000_0000_0000u64;
+                    ret_u = ret_u.wrapping_sub(y0 << 63);
+                    ret_u = ret_u.wrapping_sub(y1 << 62);
+
+                    let sh: u32 = ((k + p_i32) & 63) as u32;
+                    sum = sum.wrapping_add(ret_u >> sh);
+
+                    b[k as usize] += y0 as i32;
+                    b[(k + 1) as usize] += y1 as i32;
+                    b[(k + 2) as usize] += 1;
                 }
-                // ret << (62 - p)
-                let sh = (62 - p_i32) as u32;
-                sum = sum.wrapping_add(ret_u << sh);
-            } else {
-                // Large-range bucket
-                let k = r2 >> 2;
-                let y0 = (r & 1) as u64;
-                let y1 = ((r >> 1) & 1) as u64;
+            }
+        }
 
-                // 0xE000_0000_0000_0000L minus top-bit masks; Java then uses `>>>`
-                let mut ret_u: u64 = 0xE000_0000_0000_0000u64;
-                ret_u = ret_u.wrapping_sub(y0 << 63);
-                ret_u = ret_u.wrapping_sub(y1 << 62);
+        #[cfg(not(feature = "stdsimd"))]
+        {
+            for &r_u8 in state {
+                let r = r_u8 as i32;
+                let r2 = r - ((p_i32 << 2) + 4);
+                if r2 < 0 {
+                    let mut ret_u: u64 = 4;
+                    if r2 == -2 || r2 == -8 {
+                        b[0] += 1;
+                        ret_u = ret_u.wrapping_sub(2);
+                    }
+                    if r2 == -2 || r2 == -4 {
+                        b[1] += 1;
+                        ret_u = ret_u.wrapping_sub(1);
+                    }
+                    let sh = (62 - p_i32) as u32;
+                    sum = sum.wrapping_add(ret_u << sh);
+                } else {
+                    let k = r2 >> 2;
+                    let y0 = (r & 1) as u64;
+                    let y1 = ((r >> 1) & 1) as u64;
 
-                // shift count is masked in Java: (k + p) & 63
-                let sh: u32 = ((k + p_i32) & 63) as u32;
-                sum = sum.wrapping_add(ret_u >> sh);
+                    let mut ret_u: u64 = 0xE000_0000_0000_0000u64;
+                    ret_u = ret_u.wrapping_sub(y0 << 63);
+                    ret_u = ret_u.wrapping_sub(y1 << 62);
 
-                // tallies for the Newton solver
-                b[k as usize] += y0 as i32;
-                b[(k + 1) as usize] += y1 as i32;
-                b[(k + 2) as usize] += 1;
+                    let sh: u32 = ((k + p_i32) & 63) as u32;
+                    sum = sum.wrapping_add(ret_u >> sh);
+
+                    b[k as usize] += y0 as i32;
+                    b[(k + 1) as usize] += y1 as i32;
+                    b[(k + 2) as usize] += 1;
+                }
             }
         }
 
@@ -946,7 +1133,6 @@ impl Estimator for MaximumLikelihoodEstimator {
             / (1.0 + ML_BIAS_CORRECTION_CONSTANT / m as f64)
     }
 }
-
 
 // Helper function for MaximumLikelihoodEstimator
 fn solve_maximum_likelihood_equation(a: f64, b: &[i32], max_k: i32, eps: f64) -> f64 {
@@ -1490,6 +1676,130 @@ mod tests {
             gm_packed <= 0.80,
             "expected ≲ 0.80 (≈≥20% saving), got {:.3}",
             gm_packed
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "stdsimd"))]
+    fn timing_estimate_many_scalar() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Large-ish config; tweak if you want longer/shorter runs.
+        let p: u32 = 18;                  // m = 1,048,576 registers
+        let n_per_build: usize = 1 << 21; // ~2,097,152 inserts (≈2×m)
+        let clones: usize = 4;
+        let reps: usize = 20;
+
+        // Build one big sketch with a SplitMix64-like stream (inline, no helpers)
+        let mut base = UltraLogLog::new(p).expect("valid p");
+        let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+        for _ in 0..n_per_build {
+            // splitmix64 step (inline)
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            base.add(z);
+        }
+
+        // Clone to avoid re-hashing time in the loop
+        let sketches: Vec<UltraLogLog> = (0..clones).map(|_| base.copy()).collect();
+        let total_estimates = (reps * clones) as f64;
+
+        // FGRA
+        let t0 = Instant::now();
+        let mut sink = 0.0f64;
+        for _ in 0..reps {
+            for s in &sketches {
+                sink += black_box(OptimalFGRAEstimator.estimate(s));
+            }
+        }
+        let dt = t0.elapsed();
+        println!(
+            "[scalar] FGRA: total={:?}, per_estimate={:.3} ms (sink={})",
+            dt,
+            dt.as_secs_f64() * 1e3 / total_estimates,
+            sink
+        );
+
+        // MLE
+        let t1 = Instant::now();
+        let mut sink2 = 0.0f64;
+        for _ in 0..reps {
+            for s in &sketches {
+                sink2 += black_box(MaximumLikelihoodEstimator.estimate(s));
+            }
+        }
+        let dt1 = t1.elapsed();
+        println!(
+            "[scalar] MLE : total={:?}, per_estimate={:.3} ms (sink={})",
+            dt1,
+            dt1.as_secs_f64() * 1e3 / total_estimates,
+            sink2
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SIMD version (compile/run WITH `--features stdsimd`)
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    #[cfg(feature = "stdsimd")]
+    fn timing_estimate_many_simd() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let p: u32 = 18;                  // m = 1,048,576
+        let n_per_build: usize = 1 << 21; // ≈2×m inserts
+        let clones: usize = 4;
+        let reps: usize = 20;
+
+        // Build one big sketch (same inline SplitMix64)
+        let mut base = UltraLogLog::new(p).expect("valid p");
+        let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+        for _ in 0..n_per_build {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            base.add(z);
+        }
+
+        let sketches: Vec<UltraLogLog> = (0..clones).map(|_| base.copy()).collect();
+        let total_estimates = (reps * clones) as f64;
+
+        // FGRA
+        let t0 = Instant::now();
+        let mut sink = 0.0f64;
+        for _ in 0..reps {
+            for s in &sketches {
+                sink += black_box(OptimalFGRAEstimator.estimate(s));
+            }
+        }
+        let dt = t0.elapsed();
+        println!(
+            "[simd] FGRA: total={:?}, per_estimate={:.3} ms (sink={})",
+            dt,
+            dt.as_secs_f64() * 1e3 / total_estimates,
+            sink
+        );
+
+        // MLE
+        let t1 = Instant::now();
+        let mut sink2 = 0.0f64;
+        for _ in 0..reps {
+            for s in &sketches {
+                sink2 += black_box(MaximumLikelihoodEstimator.estimate(s));
+            }
+        }
+        let dt1 = t1.elapsed();
+        println!(
+            "[simd] MLE : total={:?}, per_estimate={:.3} ms (sink={})",
+            dt1,
+            dt1.as_secs_f64() * 1e3 / total_estimates,
+            sink2
         );
     }
 }
