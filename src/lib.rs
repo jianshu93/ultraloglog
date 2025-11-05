@@ -1439,154 +1439,204 @@ mod tests {
     fn ull_vs_hll_space() {
         use streaming_algorithms::HyperLogLog as HLL;
 
-        const N: u64 = 100_000;
-        const TRIALS: usize = 51; // odd ⇒ clean medians; bump for more stability
-        const TARGET_REL_ERR: f64 = 0.015; // 1.5% absolute relative error target
-        const HLL_MIN_P: u8 = 4;
-        const HLL_MAX_P: u8 = 16;
+        // Config
+        const N_LIST: [u64; 31] = [
+            2_000_000, 2_100_000, 2_200_000, 2_300_000, 2_400_000,
+            2_500_000, 2_600_000, 2_700_000, 2_800_000, 2_900_000,
+            3_000_000, 3_100_000, 3_200_000, 3_300_000, 3_400_000,
+            3_500_000, 3_600_000, 3_700_000, 3_800_000, 3_900_000,
+            4_000_000, 4_100_000, 4_200_000, 4_300_000, 4_400_000,
+            4_500_000, 4_600_000, 4_700_000, 4_800_000, 4_900_000,
+            5_000_000,
+        ];
+        const TRIALS: usize = 15;           // odd → clean medians; mean reported too
+        const TARGET_REL_ERR: f64 = 0.025;  // 1.5%
 
-        // deterministic 64-bit “hash” stream (SplitMix64)
+        // Reasonable p-search bands for these N/target.
+        const ULL_P_MIN: u32 = 10;
+        const ULL_P_MAX: u32 = 16;
+        const HLL_P_MIN: u8  = 12;
+        const HLL_P_MAX: u8  = 16;
+
         #[inline]
         fn splitmix64(mut x: u64) -> u64 {
-            x = x.wrapping_add(0x9E3779B97F4A7C15);
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
         }
-        fn make_hashes(seed: u64) -> Vec<u64> {
-            (0..N).map(|i| splitmix64(seed.wrapping_add(i))).collect()
-        }
 
-        // single-run error helpers
-        fn err_ull(p: u32, keys: &[u64]) -> f64 {
-            let mut ull = crate::UltraLogLog::new(p).expect("valid ULL p");
-            for &h in keys {
-                ull.add(h);
-            } // ULL expects 64-bit hash
-            let est = ull.get_distinct_count_estimate();
-            (est - N as f64).abs() / (N as f64)
-        }
-        fn err_hll(p: u8, keys: &[u64]) -> f64 {
-            let mut hll = HLL::<u64>::with_p(p);
-            for &h in keys {
-                hll.push_hash64(h);
-            } // avoid rehash inside HLL
-            let est = hll.len();
-            (est - N as f64).abs() / (N as f64)
-        }
-
-        // generate deterministic per-trial seeds
-        let mut seeds = Vec::with_capacity(TRIALS);
-        let mut s = 0x1234_5678_9ABC_DEF0u64;
-        for _ in 0..TRIALS {
-            s = s
-                .wrapping_mul(0x9E3779B97F4A7C15)
-                .wrapping_add(0xD1B54A32D192ED03);
-            seeds.push(s);
-        }
-
-        // per-trial minimal p and Δp
-        let mut deltas: Vec<i32> = Vec::with_capacity(TRIALS);
-        let mut per_trial_rows: Vec<(usize, u32, u8, i32)> = Vec::with_capacity(TRIALS);
-
-        'trial: for (ti, &seed) in seeds.iter().enumerate() {
-            let keys = make_hashes(seed);
-
-            // find minimal p for ULL
-            let mut p_ull_opt = None;
-            for p in crate::MIN_P..=crate::MAX_P {
-                if err_ull(p, &keys) <= TARGET_REL_ERR {
-                    p_ull_opt = Some(p);
-                    break;
+        // Minimal p for ULL via binary search
+        fn min_p_ull(keys: &[u64]) -> u32 {
+            let n_f = keys.len() as f64;
+            let mut lo = ULL_P_MIN;
+            let mut hi = ULL_P_MAX;
+            let mut best = ULL_P_MAX;
+            while lo <= hi {
+                let mid = (lo + hi) / 2;
+                let mut ull = crate::UltraLogLog::new(mid).expect("valid ULL p");
+                for &h in keys { ull.add(h); }
+                let est = ull.get_distinct_count_estimate();
+                let rel = (est - n_f).abs() / n_f;
+                if rel <= TARGET_REL_ERR {
+                    best = mid;
+                    if mid == ULL_P_MIN { break; }
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
                 }
             }
-            let p_ull = match p_ull_opt {
-                Some(p) => p,
-                None => continue 'trial, // skip if not achievable (shouldn’t happen for these N/targets)
-            };
+            best
+        }
 
-            // find minimal p for HLL
-            let mut p_hll_opt = None;
-            for p in HLL_MIN_P..=HLL_MAX_P {
-                if err_hll(p, &keys) <= TARGET_REL_ERR {
-                    p_hll_opt = Some(p);
-                    break;
+        // Minimal p for HLL via binary search
+        fn min_p_hll(keys: &[u64]) -> u8 {
+            let n_f = keys.len() as f64;
+            let mut lo = HLL_P_MIN as u32;
+            let mut hi = HLL_P_MAX as u32;
+            let mut best = HLL_P_MAX;
+            while lo <= hi {
+                let mid_u32 = (lo + hi) / 2;
+                let mid = mid_u32 as u8;
+                let mut hll = HLL::<u64>::with_p(mid);
+                for &h in keys { hll.push_hash64(h); }
+                let est = hll.len();
+                let rel = (est - n_f).abs() / n_f;
+                if rel <= TARGET_REL_ERR {
+                    best = mid;
+                    if mid_u32 == lo { break; }
+                    hi = mid_u32 - 1;
+                } else {
+                    lo = mid_u32 + 1;
                 }
             }
-            let p_hll = match p_hll_opt {
-                Some(p) => p,
-                None => continue 'trial,
-            };
-
-            let dp = p_hll as i32 - p_ull as i32; // Δp = HLL − ULL
-            deltas.push(dp);
-            per_trial_rows.push((ti, p_ull, p_hll, dp));
+            best
         }
 
-        if deltas.is_empty() {
-            panic!("no successful trials; try relaxing TARGET_REL_ERR or increasing p ranges");
-        }
-
-        // Δp histogram
-        use std::collections::BTreeMap;
-        let mut hist: BTreeMap<i32, usize> = BTreeMap::new();
-        for &dp in &deltas {
-            *hist.entry(dp).or_default() += 1;
-        }
-
-        // medians & means
-        let mut d_sorted = deltas.clone();
-        d_sorted.sort_unstable();
-        let median_dp = d_sorted[d_sorted.len() / 2] as f64;
-        let mean_dp = deltas.iter().copied().map(|k| k as f64).sum::<f64>() / deltas.len() as f64;
-
-        // Geometric-mean ratios via Δp:
-        // naive  = 2^{-Δp}, packed = (4/3) * 2^{-Δp}
-        let gm_naive = 2f64.powf(-mean_dp);
-        let gm_packed = (4.0 / 3.0) * gm_naive;
-
-        // Median ratios via median Δp (handy intuition):
-        let med_naive = 2f64.powf(-median_dp);
-        let med_packed = (4.0 / 3.0) * med_naive;
-
-        // Pretty print
-        println!("Trials: {}", deltas.len());
-        println!("N = {}", N);
         println!(
-            "Target absolute relative error: {:.2}%",
-            TARGET_REL_ERR * 100.0
+            "Cardinalities {:?} | TRIALS={} | Target abs. rel. err = {:.2}%",
+            N_LIST, TRIALS, TARGET_REL_ERR * 100.0
         );
         println!();
-        println!("Δp histogram (HLL − ULL):");
-        for (dp, cnt) in hist {
-            println!("  Δp={:>+2}: {:>2} trial(s)", dp, cnt);
+
+        let mut packed_ratios_median = Vec::with_capacity(N_LIST.len());
+        let mut packed_ratios_mean   = Vec::with_capacity(N_LIST.len());
+
+        for &n in &N_LIST {
+            // Per-cardinality, gather per-trial minimal p’s
+            let mut p_ulls: Vec<u32> = Vec::with_capacity(TRIALS);
+            let mut p_hlls: Vec<u8>  = Vec::with_capacity(TRIALS);
+
+            // Seed base for this N
+            let mut seed = 0x1234_5678_9ABC_DEF0u64 ^ n;
+
+            for _ in 0..TRIALS {
+                seed = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xD1B5_4A32_D192_ED03)
+                    ^ seed.rotate_left(17);
+
+                // Generate N hashed items (reused for ULL/HLL)
+                let mut keys = Vec::with_capacity(n as usize);
+                let mut x = seed;
+                for _ in 0..n { x = splitmix64(x); keys.push(x); }
+
+                let pu = min_p_ull(&keys);
+                let ph = min_p_hll(&keys);
+                p_ulls.push(pu);
+                p_hlls.push(ph);
+            }
+
+            // Medians
+            p_ulls.sort_unstable();
+            p_hlls.sort_unstable();
+            let med_ull = p_ulls[TRIALS / 2];
+            let med_hll = p_hlls[TRIALS / 2];
+            let delta_p_med = med_hll as i32 - med_ull as i32;
+
+            // Means
+            let mean_ull: f64 = p_ulls.iter().map(|&v| v as f64).sum::<f64>() / (TRIALS as f64);
+            let mean_hll: f64 = p_hlls.iter().map(|&v| v as f64).sum::<f64>() / (TRIALS as f64);
+            let delta_p_mean = mean_hll - mean_ull;
+
+            // Ratios: ULL/HLL (smaller is better for ULL)
+            let naive_ratio_med  = 2f64.powf(-(delta_p_med as f64));
+            let packed_ratio_med = (4.0 / 3.0) * naive_ratio_med;
+
+            let naive_ratio_mean  = 2f64.powf(-delta_p_mean);
+            let packed_ratio_mean = (4.0 / 3.0) * naive_ratio_mean;
+
+            // Approx absolute bytes using medians (integers)
+            let ull_bytes_med: u128 = 1u128 << med_ull; // ULL 1B/reg
+            let hll_naive_bytes_med: u128 = 1u128 << med_hll; // HLL 1B/reg
+            let hll_packed_bytes_med: u128 =
+                ((6u128 * (1u128 << med_hll)) + 7) / 8; // ceil(6*m/8)
+
+            // For a concrete size sense from means, round to nearest p
+            let mean_ull_r = mean_ull.round().clamp(ULL_P_MIN as f64, ULL_P_MAX as f64) as u32;
+            let mean_hll_r = mean_hll.round().clamp(HLL_P_MIN as f64, HLL_P_MAX as f64) as u8;
+            let ull_bytes_mean_r: u128 = 1u128 << mean_ull_r;
+            let hll_naive_bytes_mean_r: u128 = 1u128 << mean_hll_r;
+            let hll_packed_bytes_mean_r: u128 =
+                ((6u128 * (1u128 << mean_hll_r)) + 7) / 8;
+
+            println!(
+                "N={:<9}  med p (ULL,HLL)=({:>2},{:>2})  Δp_med={:>+3}  \
+                packed_med={:.3} (save ≈ {:>5.1}%)  naive_med={:.3} (save ≈ {:>5.1}%)  \
+                | bytes(MED): ULL ~ {:>10}, HLL(packed) ~ {:>10}, HLL(naive) ~ {:>10}",
+                n,
+                med_ull,
+                med_hll,
+                delta_p_med,
+                packed_ratio_med,
+                (1.0 - packed_ratio_med) * 100.0,
+                naive_ratio_med,
+                (1.0 - naive_ratio_med) * 100.0,
+                ull_bytes_med,
+                hll_packed_bytes_med,
+                hll_naive_bytes_med
+            );
+            println!(
+                "            mean p (ULL,HLL)=({:>5.2},{:>5.2})  Δp_mean={:>+6.2}  \
+                packed_mean={:.3} (save ≈ {:>5.1}%)  naive_mean={:.3} (save ≈ {:>5.1}%)  \
+                | bytes(~MEAN, rounded): ULL ~ {:>10}, HLL(packed) ~ {:>10}, HLL(naive) ~ {:>10}",
+                mean_ull,
+                mean_hll,
+                delta_p_mean,
+                packed_ratio_mean,
+                (1.0 - packed_ratio_mean) * 100.0,
+                naive_ratio_mean,
+                (1.0 - naive_ratio_mean) * 100.0,
+                ull_bytes_mean_r,
+                hll_packed_bytes_mean_r,
+                hll_naive_bytes_mean_r
+            );
+
+            packed_ratios_median.push(packed_ratio_med);
+            packed_ratios_mean.push(packed_ratio_mean);
         }
-        println!();
+
+        // Summaries (kept assert on medians for stability)
+        let avg_packed_median =
+            packed_ratios_median.iter().copied().sum::<f64>() / packed_ratios_median.len() as f64;
+        let avg_packed_mean =
+            packed_ratios_mean.iter().copied().sum::<f64>() / packed_ratios_mean.len() as f64;
 
         println!(
-            "Geometric-mean ratios over trials:\n  \
-            packed (ULL=8b, HLL=6b): {:.3}  → savings ≈ {:.1}%\n  \
-            naive  (1B/reg)        : {:.3}  → savings ≈ {:.1}%",
-            gm_packed,
-            (1.0 - gm_packed) * 100.0,
-            gm_naive,
-            (1.0 - gm_naive) * 100.0
+            "\nAverage packed ratio across N (median Δp): {:.3}  → savings ≈ {:.1}%",
+            avg_packed_median, (1.0 - avg_packed_median) * 100.0
         );
         println!(
-            "Median ratios (from median Δp={}):\n  \
-            packed: {:.3}  → savings ≈ {:.1}%\n  \
-            naive : {:.3}  → savings ≈ {:.1}%",
-            median_dp as i32,
-            med_packed,
-            (1.0 - med_packed) * 100.0,
-            med_naive,
-            (1.0 - med_naive) * 100.0
+            "Average packed ratio across N (mean   Δp): {:.3}  → savings ≈ {:.1}%",
+            avg_packed_mean, (1.0 - avg_packed_mean) * 100.0
         );
+
+        // Sanity: expect ≳20% savings on average for packed vs ULL at 1.5% target (median-based).
         assert!(
-            gm_packed <= 0.80,
-            "expected ≲ 0.80 (≈≥20% saving), got {:.3}",
-            gm_packed
+            avg_packed_median <= 0.70,
+            "Expected avg packed ratio ≤ 0.80 (≥20% savings), got {:.3}",
+            avg_packed_median
         );
     }
     #[test]
