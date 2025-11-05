@@ -1449,7 +1449,7 @@ mod tests {
             4_500_000, 4_600_000, 4_700_000, 4_800_000, 4_900_000,
             5_000_000,
         ];
-        const TRIALS: usize = 15;           // odd → clean medians; mean reported too
+        const TRIALS: usize = 15;  
         const TARGET_REL_ERR: f64 = 0.025;  // 1.5%
 
         // Reasonable p-search bands for these N/target.
