@@ -34,6 +34,7 @@ polymur-hash = "0.2.2"
 wyhash = "0.6.0"
 t1ha = "0.1.2"
 streaming_algorithms = {version = "0.3.3", features = ["serde", "stdsimd"]}
+simple_hll = "0.0.4"
 
 [[bench]]
 name = "ultraloglog"

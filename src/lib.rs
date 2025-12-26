@@ -1821,9 +1821,7 @@ mod tests {
             );
         }
 
-        // ---------------------------------------------------------------------
         // extra part: stress at large cardinalities (1M → 10M)
-        // ---------------------------------------------------------------------
         // smaller to keep runtime sane
         const SKETCHES_PER_CASE: usize = 8;
         // you said “1 million to 10 million”
@@ -1891,5 +1889,225 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn ull_vs_simple_hll_space() {
+        // UltraLogLog (1 byte/register) vs simple_hll HyperLogLog (also 1 byte/register)
+        // Same 64-bit stream, compare minimal p achieving TARGET_REL_ERR.
+        //
+        // IMPORTANT:
+        // - We do *not* “fold registers” from a larger-P HLL into a smaller-P HLL.
+        //   That is invalid for simple_hll because rho depends on P (hash >> P).
+        // - Instead, we rescan the same generated hash stream for each candidate P.
+        //
+        // This measures REAL memory usage for simple_hll (Vec<u8> registers),
+        // NOT a theoretical packed-6bit HLL.
+
+        use std::collections::HashMap;
+
+        const N_LIST: [u64; 31] = [
+            2_000_000, 2_100_000, 2_200_000, 2_300_000, 2_400_000, 2_500_000, 2_600_000, 2_700_000,
+            2_800_000, 2_900_000, 3_000_000, 3_100_000, 3_200_000, 3_300_000, 3_400_000, 3_500_000,
+            3_600_000, 3_700_000, 3_800_000, 3_900_000, 4_000_000, 4_100_000, 4_200_000, 4_300_000,
+            4_400_000, 4_500_000, 4_600_000, 4_700_000, 4_800_000, 4_900_000, 5_000_000,
+        ];
+
+        // keep runtime sane in CI
+        const TRIALS: usize = 19;
+
+        // target absolute relative error
+        const TARGET_REL_ERR: f64 = 0.010; // 1.0%
+
+        // ULL p-search band for these N/target.
+        const ULL_P_MIN: u32 = 10;
+        const ULL_P_MAX: u32 = 16;
+
+        // simple_hll supports P in [4,18]
+        const HLL_P_MIN: u32 = 10;
+        const HLL_P_MAX: u32 = 18;
+
+        #[inline]
+        fn splitmix64(mut x: u64) -> u64 {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn ull_estimate_from_max(ull_max: &crate::UltraLogLog, p: u32) -> f64 {
+            if p == ull_max.get_p() {
+                ull_max.get_distinct_count_estimate()
+            } else {
+                let d = ull_max.downsize(p).expect("downsize ULL");
+                d.get_distinct_count_estimate()
+            }
+        }
+
+        fn min_p_ull_from_max(ull_max: &crate::UltraLogLog, n: usize) -> u32 {
+            let n_f = n as f64;
+            let mut lo = ULL_P_MIN;
+            let mut hi = ULL_P_MAX;
+            let mut best = ULL_P_MAX;
+
+            while lo <= hi {
+                let mid = (lo + hi) / 2;
+                let est = ull_estimate_from_max(ull_max, mid);
+                let rel = (est - n_f).abs() / n_f;
+                if rel <= TARGET_REL_ERR {
+                    best = mid;
+                    if mid == ULL_P_MIN {
+                        break;
+                    }
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            best
+        }
+
+        // Build HLL::<P> from the exact same hash stream, then compute rel err.
+        fn simple_hll_rel_err_from_hashes(p: u32, hashes: &[u64], n: usize) -> f64 {
+            macro_rules! run {
+                ($pp:literal) => {{
+                    let mut hll = simple_hll::HyperLogLog::<$pp>::new();
+                    for &x in hashes {
+                        hll.add_hash(x);
+                    }
+                    let est = hll.count() as f64;
+                    let n_f = n as f64;
+                    (est - n_f).abs() / n_f
+                }};
+            }
+            match p {
+                4 => run!(4),
+                5 => run!(5),
+                6 => run!(6),
+                7 => run!(7),
+                8 => run!(8),
+                9 => run!(9),
+                10 => run!(10),
+                11 => run!(11),
+                12 => run!(12),
+                13 => run!(13),
+                14 => run!(14),
+                15 => run!(15),
+                16 => run!(16),
+                17 => run!(17),
+                18 => run!(18),
+                _ => panic!("simple_hll P out of range: {}", p),
+            }
+        }
+
+        fn min_p_hll_from_hashes(hashes: &[u64], n: usize) -> u32 {
+            let mut lo = HLL_P_MIN;
+            let mut hi = HLL_P_MAX;
+            let mut best = HLL_P_MAX;
+
+            // cache rel err by p for this trial (binary search would otherwise rebuild some P twice)
+            let mut cache: HashMap<u32, f64> = HashMap::new();
+
+            let mut rel = |p: u32| -> f64 {
+                *cache
+                    .entry(p)
+                    .or_insert_with(|| simple_hll_rel_err_from_hashes(p, hashes, n))
+            };
+
+            while lo <= hi {
+                let mid = (lo + hi) / 2;
+                if rel(mid) <= TARGET_REL_ERR {
+                    best = mid;
+                    if mid == HLL_P_MIN {
+                        break;
+                    }
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            best
+        }
+
+        println!(
+            "Cardinalities {:?} | TRIALS={} | Target abs. rel. err = {:.2}%",
+            N_LIST,
+            TRIALS,
+            TARGET_REL_ERR * 100.0
+        );
+        println!();
+
+        let mut ratios_med = Vec::with_capacity(N_LIST.len());
+
+        for &n in &N_LIST {
+            let mut p_ulls = Vec::with_capacity(TRIALS);
+            let mut p_hlls = Vec::with_capacity(TRIALS);
+
+            let mut seed = 0x1234_5678_9ABC_DEF0u64 ^ n;
+
+            for _ in 0..TRIALS {
+                seed = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xD1B5_4A32_D192_ED03)
+                    ^ seed.rotate_left(17);
+
+                // Generate N hashed items (reused for ULL/HLL).
+                // NOTE: This is memory-heavy but correct; u64 * 5,000,000 ≈ 40MB.
+                let mut hashes: Vec<u64> = Vec::with_capacity(n as usize);
+
+                // Build ULL once at max p so we can downsize cheaply during p-search.
+                let mut ull_max = crate::UltraLogLog::new(ULL_P_MAX).expect("ULL max alloc");
+
+                let mut x = seed;
+                for _ in 0..(n as usize) {
+                    x = splitmix64(x);
+                    hashes.push(x);
+                    ull_max.add(x);
+                }
+
+                let pu = min_p_ull_from_max(&ull_max, n as usize);
+                let ph = min_p_hll_from_hashes(&hashes, n as usize);
+
+                p_ulls.push(pu);
+                p_hlls.push(ph);
+            }
+
+            p_ulls.sort_unstable();
+            p_hlls.sort_unstable();
+
+            let med_ull = p_ulls[TRIALS / 2];
+            let med_hll = p_hlls[TRIALS / 2];
+            let delta = med_hll as i32 - med_ull as i32;
+
+            // REAL bytes for both here: 1 byte/register
+            let ull_bytes: u128 = 1u128 << med_ull;
+            let hll_bytes: u128 = 1u128 << med_hll;
+
+            let ratio = (ull_bytes as f64) / (hll_bytes as f64); // <1 means ULL smaller
+            ratios_med.push(ratio);
+
+            println!(
+                "N={:<9}  med p (ULL,HLL)=({:>2},{:>2})  Δp={:>+3}  \
+                bytes: ULL ~ {:>10}, HLL ~ {:>10}  ratio(ULL/HLL)={:.3} (save ≈ {:>5.1}%)",
+                n,
+                med_ull,
+                med_hll,
+                delta,
+                ull_bytes,
+                hll_bytes,
+                ratio,
+                (1.0 - ratio) * 100.0
+            );
+        }
+
+        let avg_ratio = ratios_med.iter().copied().sum::<f64>() / (ratios_med.len() as f64);
+        println!(
+            "\nAverage ratio across N (median p): {:.3}  → avg savings ≈ {:.1}%",
+            avg_ratio,
+            (1.0 - avg_ratio) * 100.0
+        );
+
+        // Sanity only (avoid flakiness).
+        assert!(avg_ratio.is_finite() && avg_ratio > 0.0);
     }
 }

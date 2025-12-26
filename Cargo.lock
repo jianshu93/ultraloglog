@@ -706,6 +706,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple_hll"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23fffa79a74515ff36cfed9899bafa88ea5eeae07512a130aa7c50a870d96e02"
+dependencies = [
+ "ahash",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -786,6 +795,7 @@ dependencies = [
  "pyo3",
  "rand 0.8.5",
  "serde",
+ "simple_hll",
  "streaming_algorithms",
  "t1ha",
  "wyhash",
